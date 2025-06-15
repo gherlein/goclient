@@ -54,62 +54,57 @@ func NewAgent(modelName string, getUserMessage func() (string, bool), systemProm
 		modelName:      modelName,
 		getUserMessage: getUserMessage,
 		systemPrompt:   systemPrompt,
-		httpClient:     &http.Client{Timeout: 60 * time.Second}, // Added a timeout
+		httpClient:     &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	// For Ollama, conversation history is typically managed by resending messages.
-	// Some models might support a 'context' field, but sending message history is more common.
-	var conversationHistory []string // Stores "role: content" pairs or just content
+	var conversationHistory []string // Stores user inputs and AI responses for context
 
-	fmt.Printf("Chat with Ollama model %s (use 'ctrl-c' to quit)\n", a.modelName)
+	fmt.Printf("Chat with Ollama model %s (type 'exit' to quit)\n", a.modelName)
 
 	for {
-		// The getUserMessage function now handles printing the "You: " or "You (from file...): " prompt
-		userInput, ok := a.getUserMessage()
+		userInput, ok := a.getUserMessage() // This now handles its own prompting
 		if !ok {
 			break // End of input or scanner error
 		}
 
-		// Add user input to history (simple append, Ollama doesn't have structured roles like Anthropic)
-		conversationHistory = append(conversationHistory, userInput)
+		if strings.ToLower(strings.TrimSpace(userInput)) == "exit" {
+			fmt.Println("Exiting chat.")
+			break
+		}
 
-		// Construct the prompt for Ollama. Could be just the latest userInput,
-		// or a concatenation of conversationHistory.
-		// For simplicity, let's use the latest input as the main prompt,
-		// and the system prompt for overall instructions.
-		// More advanced: format conversationHistory into the prompt string.
-		currentPrompt := userInput
+		// Add user input to history
+		conversationHistory = append(conversationHistory, fmt.Sprintf("User: %s", userInput))
 
-		fmt.Print("\u001b[93mAI\u001b[0m: ") // Yellow for AI
-		// Stats tracking for this inference
+		// Construct the prompt for Ollama, including history
+		// The runInference method will now receive the full history and format it.
+		// The 'currentPrompt' is effectively the last user message.
+		currentPrompt := userInput // For clarity, though runInference will use history
+
+		fmt.Print("\u001b[93mAI\u001b[0m: ")
 		inferenceStartTime := time.Now()
-		var responseTokens int // Approximate based on words or implement proper tokenizer
+		var responseTokens int
+		var fullAIReponse strings.Builder // To capture the full AI response for history
 
 		err := a.runInference(ctx, currentPrompt, conversationHistory, func(responsePart string) {
 			fmt.Print(responsePart)
-			responseTokens += len(strings.Fields(responsePart)) // Approximate token count
+			fullAIReponse.WriteString(responsePart) // Capture streamed parts
+			responseTokens += len(strings.Fields(responsePart))
 		})
 
 		if err != nil {
 			fmt.Printf("\nError during inference: %v\n", err)
-			// Decide if to continue or break; for now, let's continue
-			// Remove last user message from history if inference failed before AI response
-			if len(conversationHistory) > 0 {
-				// This is tricky, as AI might have started responding.
-				// For now, we'll keep it to avoid losing user input.
-			}
+			// Optionally remove the last user message from history if inference failed badly
+			// conversationHistory = conversationHistory[:len(conversationHistory)-1]
 			continue
 		}
 		fmt.Println() // Newline after AI's full response
 
-		// Add AI's (full) response to history - this part is tricky with streaming.
-		// The runInference callback handles printing. We need the full response here.
-		// For now, conversationHistory only stores user inputs.
-		// To store AI responses, runInference would need to return the full response string.
+		// Add AI's full response to history
+		conversationHistory = append(conversationHistory, fmt.Sprintf("AI: %s", fullAIReponse.String()))
 
-		// Print stats
+
 		duration := time.Since(inferenceStartTime)
 		tps := 0.0
 		if duration.Seconds() > 0 {
@@ -121,37 +116,23 @@ func (a *Agent) Run(ctx context.Context) error {
 	return nil
 }
 
-// runInference sends the prompt to Ollama and handles streaming response
-func (a *Agent) runInference(ctx context.Context, prompt string, history []string, streamCallback func(responsePart string)) error {
-	// Simple way to include history: prepend to the current prompt.
-	// This might not be ideal for all models or long histories.
-	// Some Ollama models might prefer a specific format or use a 'context' field.
-	fullPrompt := strings.Join(history, "\n\n") // Join all history, then add current prompt
-	if len(history) > 1 { // If there's actual history beyond the current prompt
-		// Construct a prompt that includes history. This is a simple example.
-		// You might want to format it differently, e.g., "User: ...\nAI: ...\nUser: current_prompt"
-		var historyForPrompt strings.Builder
-		for i, msg := range history[:len(history)-1] { // Exclude the current prompt from this part of history
-			if i%2 == 0 { // Assuming user, AI, user, AI... pattern if we were storing AI responses
-				historyForPrompt.WriteString("User: ")
-			} else {
-				historyForPrompt.WriteString("AI: ")
-			}
-			historyForPrompt.WriteString(msg)
-			historyForPrompt.WriteString("\n\n")
-		}
-		fullPrompt = historyForPrompt.String() + "User: " + prompt
-	} else {
-		fullPrompt = "User: " + prompt // Just the current prompt if no other history
+func (a *Agent) runInference(ctx context.Context, currentPrompt string, history []string, streamCallback func(responsePart string)) error {
+	// Construct the prompt for Ollama using the entire history.
+	// The last element of history is the current user prompt.
+	var promptForOllama strings.Builder
+	for _, msg := range history {
+		promptForOllama.WriteString(msg)
+		promptForOllama.WriteString("\n\n") // Separate messages with double newlines
 	}
+	// Add a final "AI:" to signal the model to generate the AI's response.
+	promptForOllama.WriteString("AI:")
 
 
 	requestPayload := OllamaRequest{
 		Model:  a.modelName,
-		Prompt: fullPrompt, // Send the constructed prompt
+		Prompt: promptForOllama.String(), // Send the full constructed prompt
 		System: a.systemPrompt,
 		Stream: true,
-		// Messages: history, // Alternative way to send history if model supports it
 	}
 
 	payloadBytes, err := json.Marshal(requestPayload)
@@ -187,9 +168,11 @@ func (a *Agent) runInference(ctx context.Context, prompt string, history []strin
 		}
 
 		var ollamaResp OllamaResponse
-		if err := json.Unmarshal(line, &ollamaResp); err != nil {
-			fmt.Printf("\nWarning: could not unmarshal Ollama response line: %s, error: %v\n", string(line), err)
-			continue
+		if errUnmarshal := json.Unmarshal(line, &ollamaResp); errUnmarshal != nil {
+			// Log problematic line and error, then continue if possible
+			// This helps to see if Ollama is sending unexpected data.
+			fmt.Printf("\nWarning: could not unmarshal Ollama response line: <%s>, error: %v\n", strings.TrimSpace(string(line)), errUnmarshal)
+			continue 
 		}
 
 		streamCallback(ollamaResp.Response)
@@ -310,23 +293,26 @@ func main() {
 
 	// Set up user input
 	scanner := bufio.NewScanner(os.Stdin)
-	isFilePromptUsed := false // State for the getUserMessage closure
+	isFilePromptUsed := false 
 
 	getUserMessage := func() (string, bool) {
+		var promptText string
 		if initialPromptFromFile != "" && !isFilePromptUsed {
 			fmt.Printf("\u001b[94mYou (from %s)\u001b[0m: %s\n", *promptFileFlag, initialPromptFromFile)
-			isFilePromptUsed = true
+			isFilePromptUsed = true // Mark as used so it's not used again
 			return initialPromptFromFile, true
 		}
 
-		fmt.Print("\u001b[94mYou\u001b[0m: ") // Standard prompt for stdin
+		// Standard prompt for stdin after initial file prompt (if any) or if no file prompt
+		fmt.Print("\u001b[94mYou\u001b[0m: ")
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				fmt.Printf("\nError reading input: %v\n", err)
 			}
-			return "", false // End of input or error
+			return "", false
 		}
-		return scanner.Text(), true
+		promptText = scanner.Text()
+		return promptText, true
 	}
 
 	systemPrompt := getSystemPrompt(*agentTypeFlag)
