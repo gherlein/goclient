@@ -10,663 +10,299 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path" // For createNewFile
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-
-	// For Ollama, we don't need the anthropic SDK directly for tool definitions
-	// but we do need jsonschema for generating input schemas.
-	"github.com/invopop/jsonschema"
 )
 
-// --- Tool Definition and Schema Generation (as per the article, adapted for local use) ---
-type ToolDefinition struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	InputSchema map[string]interface{} `json:"input_schema"` // Using generic map for Ollama
-	Function    func(input json.RawMessage) (string, error)
-}
-
-// GenerateSchema creates a JSON schema for a given Go type T.
-// This schema is used to inform the LLM about the expected input structure for a tool.
-func GenerateSchema[T any]() map[string]interface{} {
-	reflector := jsonschema.Reflector{
-		AllowAdditionalProperties: false,
-		DoNotReference:           true,
-	}
-	var v T
-	schema := reflector.Reflect(v)
-
-	props := make(map[string]interface{})
-	if schema.Properties != nil {
-		// Corrected iteration for orderedmap
-		for _, key := range schema.Properties.Keys() {
-			val, ok := schema.Properties.Get(key)
-			if !ok {
-				continue
-			}
-			propSchema := make(map[string]interface{})
-			propSchema["type"] = val.Type
-			if val.Description != "" {
-				propSchema["description"] = val.Description
-			}
-			props[key] = propSchema
-		}
-	}
-	return props
-}
-
 // --- Ollama specific types ---
-// ...existing code...
 type OllamaRequest struct {
-	Model    string `json:"model"`
-	Prompt   string `json:"prompt"`
-	Stream   bool   `json:"stream"`
-	System   string `json:"system"`
+	Model    string   `json:"model"`
+	Prompt   string   `json:"prompt"`
+	System   string   `json:"system,omitempty"`
+	Stream   bool     `json:"stream"`
+	Messages []string `json:"messages,omitempty"` // For maintaining conversation history if model supports it
 }
 
 type OllamaResponse struct {
 	Response string `json:"response"`
 	Done     bool   `json:"done"`
+	// Add other fields from Ollama's response as needed, e.g., context, eval_count, etc.
 }
 
-type OllamaModelResponse struct {
-	Models []struct {
-		Name     string `json:"name"`
-		Modified string `json:"modified_at"`
-	} `json:"models"`
+type OllamaModelInfo struct { // For listing models
+	Name       string `json:"name"`
+	ModifiedAt string `json:"modified_at"`
+	Size       int64  `json:"size"`
 }
 
-
-// --- Tool Implementations (ReadFile, ListFiles, EditFile, WriteFile) ---
-
-// ReadFile tool
-type ReadFileInput struct {
-	Path string `json:"path" jsonschema_description:"The relative path of a file in the working directory."`
-}
-
-var ReadFileDefinition = ToolDefinition{
-	Name:        "read_file",
-	Description: "Read the contents of a given relative file path. Use this when you want to see what's inside a file. Do not use this with directory names.",
-	InputSchema: GenerateSchema[ReadFileInput](),
-	Function:    ReadFile,
-}
-
-func ReadFile(input json.RawMessage) (string, error) {
-	var params ReadFileInput
-	if err := json.Unmarshal(input, &params); err != nil {
-		return "", fmt.Errorf("failed to parse input for read_file: %v", err)
-	}
-	if params.Path == "" {
-		return "", fmt.Errorf("path cannot be empty for read_file")
-	}
-	content, err := os.ReadFile(params.Path)
-	if err != nil {
-		return "", fmt.Errorf("failed to read file '%s': %v", params.Path, err)
-	}
-	return string(content), nil
-}
-
-// ListFiles tool
-type ListFilesInput struct {
-	Path string `json:"path,omitempty" jsonschema_description:"Optional relative path to list files from. Defaults to current directory if not provided."`
-}
-
-var ListFilesDefinition = ToolDefinition{
-	Name:        "list_files",
-	Description: "List files and directories at a given path. If no path is provided, lists files in the current directory.",
-	InputSchema: GenerateSchema[ListFilesInput](),
-	Function:    ListFiles,
-}
-
-func ListFiles(input json.RawMessage) (string, error) {
-	var params ListFilesInput
-	// Try to unmarshal, but it's okay if input is empty for list_files (defaults to current dir)
-	_ = json.Unmarshal(input, &params) // Error can be ignored if params.Path remains default ""
-
-	dir := "."
-	if params.Path != "" {
-		dir = params.Path
-	}
-
-	var files []string
-	err := filepath.Walk(dir, func(currentPath string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		relPath, err := filepath.Rel(dir, currentPath)
-		if err != nil {
-			return err
-		}
-		if relPath == "." { // Skip the root directory itself
-			return nil
-		}
-		if info.IsDir() {
-			files = append(files, relPath+"/")
-		} else {
-			files = append(files, relPath)
-		}
-		return nil
-	})
-
-	if err != nil {
-		return "", fmt.Errorf("failed to list files in '%s': %v", dir, err)
-	}
-	result, err := json.Marshal(files)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal file list: %v", err)
-	}
-	return string(result), nil
-}
-
-// EditFile tool (as per article)
-type EditFileInput struct {
-	Path   string `json:"path" jsonschema_description:"The path to the file"`
-	OldStr string `json:"old_str" jsonschema_description:"Text to search for. If empty and file doesn't exist, creates new file with new_str as content."`
-	NewStr string `json:"new_str" jsonschema_description:"Text to replace old_str with, or content for new file."`
-}
-
-var EditFileDefinition = ToolDefinition{
-	Name: "edit_file",
-	Description: `Make edits to a text file. Replaces 'old_str' with 'new_str' in the given file. 
-If 'old_str' is empty and the file does not exist, it creates a new file with 'new_str' as content.
-'old_str' and 'new_str' MUST be different if 'old_str' is not empty and the file exists.`,
-	InputSchema: GenerateSchema[EditFileInput](),
-	Function:    EditFile,
-}
-
-func EditFile(input json.RawMessage) (string, error) {
-	var params EditFileInput
-	if err := json.Unmarshal(input, &params); err != nil {
-		return "", fmt.Errorf("failed to parse input for edit_file: %v", err)
-	}
-
-	if params.Path == "" {
-		return "", fmt.Errorf("path cannot be empty for edit_file")
-	}
-
-	content, err := os.ReadFile(params.Path)
-	if err != nil {
-		if os.IsNotExist(err) && params.OldStr == "" { // Create new file if old_str is empty and file doesn't exist
-			// Use createNewFile which handles directory creation
-			errWrite := os.WriteFile(params.Path, []byte(params.NewStr), 0644)
-			if errWrite != nil {
-				return "", fmt.Errorf("failed to create new file '%s': %v", params.Path, errWrite)
-			}
-			return fmt.Sprintf("Successfully created file %s", params.Path), nil
-		}
-		return "", fmt.Errorf("failed to read file '%s' for editing: %v", params.Path, err)
-	}
-	
-	if params.OldStr == "" && len(content) > 0 { // File exists, old_str is empty - prevent accidental overwrite
-		return "", fmt.Errorf("file '%s' exists but old_str is empty; specify old_str for replacement or use write_file to overwrite", params.Path)
-	}
-	
-	if params.OldStr == params.NewStr && params.OldStr != "" { // old_str and new_str are same, and not for creation
-		return "", fmt.Errorf("old_str and new_str must be different for edit_file when old_str is not empty")
-	}
-
-	oldContent := string(content)
-	newContent := strings.Replace(oldContent, params.OldStr, params.NewStr, -1)
-
-	if oldContent == newContent && params.OldStr != "" { // No change made, and we weren't trying to create a file
-		return "", fmt.Errorf("old_str '%s' not found in file '%s'", params.OldStr, params.Path)
-	}
-
-	if err := os.WriteFile(params.Path, []byte(newContent), 0644); err != nil {
-		return "", fmt.Errorf("failed to write changes to file '%s': %v", params.Path, err)
-	}
-	return fmt.Sprintf("Successfully edited file %s", params.Path), nil
-}
-
-// WriteFile tool (added previously)
-type WriteFileInput struct {
-	Path    string `json:"path" jsonschema_description:"The path to the file to write. If the file exists, it will be overwritten."`
-	Content string `json:"content" jsonschema_description:"The content to write to the file."`
-}
-
-var WriteFileDefinition = ToolDefinition{
-	Name:        "write_file",
-	Description: "Write content to a file. If the file doesn't exist, it will be created. If the file exists, its contents will be overwritten.",
-	InputSchema: GenerateSchema[WriteFileInput](),
-	Function:    WriteFile,
-}
-
-func WriteFile(input json.RawMessage) (string, error) {
-	var params WriteFileInput
-	if err := json.Unmarshal(input, &params); err != nil {
-		return "", fmt.Errorf("failed to parse input for write_file: %v", err)
-	}
-	if params.Path == "" {
-		return "", fmt.Errorf("path cannot be empty for write_file")
-	}
-	// Ensure directory exists
-	dir := filepath.Dir(params.Path)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return "", fmt.Errorf("failed to create directory '%s': %w", dir, err)
-		}
-	}
-	if err := os.WriteFile(params.Path, []byte(params.Content), 0644); err != nil {
-		return "", fmt.Errorf("failed to write file '%s': %v", params.Path, err)
-	}
-	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(params.Content), params.Path), nil
-}
-
-// createNewFile helper function (from article, ensure it's present if EditFile uses it)
-// Note: The WriteFile tool above already handles directory creation and writing.
-// This function is specifically for the EditFile scenario where old_str is "" and file doesn't exist.
-// However, the EditFile implementation was simplified to directly write.
-// If createNewFile is still referenced by EditFile as per the article, it should be:
-func createNewFile(filePath, content string) (string, error) {
-	dir := path.Dir(filePath) // Use "path" for manipulating paths, "path/filepath" for OS-specific operations
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return "", fmt.Errorf("failed to create directory '%s': %w", dir, err)
-		}
-	}
-	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
-		return "", fmt.Errorf("failed to create file '%s': %w", filePath, err)
-	}
-	return fmt.Sprintf("Successfully created file %s", filePath), nil
+type OllamaTagsResponse struct {
+	Models []OllamaModelInfo `json:"models"`
 }
 
 
-// --- Agent Logic ---
+// --- Agent Logic (Simplified for Ollama) ---
 type Agent struct {
-	model          string
+	modelName      string
 	getUserMessage func() (string, bool)
-	tools         []ToolDefinition
 	systemPrompt   string
+	httpClient     *http.Client
 }
 
-func NewAgent(model string, getUserMessage func() (string, bool), agentTools []ToolDefinition, systemPrompt string) *Agent {
+func NewAgent(modelName string, getUserMessage func() (string, bool), systemPrompt string) *Agent {
 	return &Agent{
-		model:          model,
+		modelName:      modelName,
 		getUserMessage: getUserMessage,
-		tools:         agentTools,
 		systemPrompt:   systemPrompt,
+		httpClient:     &http.Client{Timeout: 60 * time.Second}, // Added a timeout
 	}
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	conversation := []string{}
-	fmt.Printf("Chat with %s (use 'ctrl-c' to quit)\n", a.model)
+	// For Ollama, conversation history is typically managed by resending messages.
+	// Some models might support a 'context' field, but sending message history is more common.
+	var conversationHistory []string // Stores "role: content" pairs or just content
 
-	readUserInput := true
-	
-	var sessionStartTime time.Time
-	var sessionTotalTokens int
-	var firstTokenReceivedInSession bool
-
+	fmt.Printf("Chat with Ollama model %s (use 'ctrl-c' to quit)\n", a.modelName)
 
 	for {
-		// ... existing Run loop logic ...
-		var currentPromptText string // Store the text of the current prompt for the LLM
-
-		if readUserInput {
-			fmt.Print("\u001b[94mYou\u001b[0m: ")
-			userInput, ok := a.getUserMessage()
-			if !ok {
-				break
-			}
-			currentPromptText = userInput
-			conversation = append(conversation, fmt.Sprintf("User: %s", userInput))
-		} else {
-			// If not reading user input, it means we are following up after a tool execution.
-			// The prompt to the LLM will be the accumulated conversation.
-			// The last message in 'conversation' is the tool result.
-			if len(conversation) > 0 {
-				currentPromptText = conversation[len(conversation)-1] // Or construct a summary
-			} else {
-				// Should not happen if loop logic is correct
-				fmt.Println("Warning: Attempting to run inference without prior input or tool result.")
-				readUserInput = true
-				continue
-			}
+		fmt.Print("\u001b[94mYou\u001b[0m: ") // Blue for user
+		userInput, ok := a.getUserMessage()
+		if !ok {
+			break // End of input or scanner error
 		}
 
+		// Add user input to history (simple append, Ollama doesn't have structured roles like Anthropic)
+		conversationHistory = append(conversationHistory, userInput)
 
-		toolsDesc := "You have the following tools available. Respond with 'tool: <tool_name>({<json_args>})' to use a tool.\n"
-		for _, tool := range a.tools {
-			toolSchemaBytes, _ := json.Marshal(tool.InputSchema) // Convert schema to string for prompt
-			toolsDesc += fmt.Sprintf("- %s: %s. Input schema: %s\n", tool.Name, tool.Description, string(toolSchemaBytes))
-		}
-		
-		// Construct the full prompt for Ollama
-		// The actual prompt sent to Ollama's "prompt" field will be the latest user message or tool result.
-		// The conversation history will be part of the system message or managed differently if Ollama supports chat history directly.
-		// For now, let's keep it simple: the "prompt" is the latest turn.
-		// The system prompt will contain the tool descriptions and overall instructions.
-
-		// Reset stats for this inference call
-		// inferenceStartTime := time.Now() // This was here, but sessionStartTime is better for overall TPS
-		inferenceTokens := 0
-		// firstTokenInInference := true // This was here, but firstTokenReceivedInSession is for the whole session
-
-		if !firstTokenReceivedInSession {
-			sessionStartTime = time.Now() // Start session timer on first actual inference attempt
-		}
+		// Construct the prompt for Ollama. Could be just the latest userInput,
+		// or a concatenation of conversationHistory.
+		// For simplicity, let's use the latest input as the main prompt,
+		// and the system prompt for overall instructions.
+		// More advanced: format conversationHistory into the prompt string.
+		currentPrompt := userInput
 
 		fmt.Print("\u001b[93mAI\u001b[0m: ") // Yellow for AI
-		// The 'promptPayload' to runInference should be the current turn's content.
-		// The 'toolsDescription' is now part of the system prompt passed to runInference.
-		llmResponseContent, err := a.runInference(ctx, currentPromptText, toolsDesc) // toolsDesc is now part of system prompt in runInference
+		// Stats tracking for this inference
+		inferenceStartTime := time.Now()
+		var responseTokens int // Approximate based on words or implement proper tokenizer
+
+		err := a.runInference(ctx, currentPrompt, conversationHistory, func(responsePart string) {
+			fmt.Print(responsePart)
+			responseTokens += len(strings.Fields(responsePart)) // Approximate token count
+		})
+
 		if err != nil {
-			fmt.Printf("\nError running inference: %v\n", err)
-			readUserInput = true 
+			fmt.Printf("\nError during inference: %v\n", err)
+			// Decide if to continue or break; for now, let's continue
+			// Remove last user message from history if inference failed before AI response
+			if len(conversationHistory) > 0 {
+				// This is tricky, as AI might have started responding.
+				// For now, we'll keep it to avoid losing user input.
+			}
+			continue
+		}
+		fmt.Println() // Newline after AI's full response
+
+		// Add AI's (full) response to history - this part is tricky with streaming.
+		// The runInference callback handles printing. We need the full response here.
+		// For now, conversationHistory only stores user inputs.
+		// To store AI responses, runInference would need to return the full response string.
+
+		// Print stats
+		duration := time.Since(inferenceStartTime)
+		tps := 0.0
+		if duration.Seconds() > 0 {
+			tps = float64(responseTokens) / duration.Seconds()
+		}
+		fmt.Printf("\u001b[90mStats: Tokens: %d, Time: %.2fs, TPS: %.2f\u001b[0m\n",
+			responseTokens, duration.Seconds(), tps)
+	}
+	return nil
+}
+
+// runInference sends the prompt to Ollama and handles streaming response
+func (a *Agent) runInference(ctx context.Context, prompt string, history []string, streamCallback func(responsePart string)) error {
+	// Simple way to include history: prepend to the current prompt.
+	// This might not be ideal for all models or long histories.
+	// Some Ollama models might prefer a specific format or use a 'context' field.
+	fullPrompt := strings.Join(history, "\n\n") // Join all history, then add current prompt
+	if len(history) > 1 { // If there's actual history beyond the current prompt
+		fullPrompt = strings.Join(history[:len(history)-1], "\n\n") + "\n\nUser: " + prompt
+	} else {
+		fullPrompt = "User: " + prompt
+	}
+
+
+	requestPayload := OllamaRequest{
+		Model:  a.modelName,
+		Prompt: fullPrompt, // Send the constructed prompt
+		System: a.systemPrompt,
+		Stream: true,
+		// Messages: history, // Alternative way to send history if model supports it
+	}
+
+	payloadBytes, err := json.Marshal(requestPayload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Ollama request: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost:11434/api/generate", bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create Ollama request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request to Ollama: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Ollama request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("error reading stream from Ollama: %v", err)
+		}
+
+		var ollamaResp OllamaResponse
+		if err := json.Unmarshal(line, &ollamaResp); err != nil {
+			fmt.Printf("\nWarning: could not unmarshal Ollama response line: %s, error: %v\n", string(line), err)
 			continue
 		}
 
-		toolCall := extractToolCall(llmResponseContent)
-		if toolCall != "" {
-			fmt.Printf("\n\u001b[92mtool\u001b[0m: %s\n", toolCall) 
-			toolResult := a.executeTool(toolCall)
-			fmt.Printf("\u001b[92mresult\u001b[0m: %s\n", toolResult) 
-			
-			conversation = append(conversation, fmt.Sprintf("Assistant: %s", llmResponseContent)) 
-			conversation = append(conversation, fmt.Sprintf("System: Tool %s executed. Result: %s", toolCall, toolResult)) 
-			readUserInput = false 
-		} else {
-			conversation = append(conversation, fmt.Sprintf("Assistant: %s", llmResponseContent))
-			readUserInput = true 
-		}
-		fmt.Println() 
+		streamCallback(ollamaResp.Response)
 
-		inferenceTokens += len(strings.Fields(llmResponseContent)) 
-		if inferenceTokens > 0 && !firstTokenReceivedInSession {
-			firstTokenReceivedInSession = true
-			// sessionStartTime is already set correctly at the start of the first inference
-		}
-		sessionTotalTokens += inferenceTokens
-		
-		if firstTokenReceivedInSession {
-			durationSinceFirstToken := time.Since(sessionStartTime)
-			if durationSinceFirstToken.Seconds() > 0 {
-				tokensPerSecond := float64(sessionTotalTokens) / durationSinceFirstToken.Seconds()
-				fmt.Printf("\u001b[90mStats: Total Tokens: %d, Time: %.2fs, TPS: %.2f\u001b[0m\n",
-					sessionTotalTokens, durationSinceFirstToken.Seconds(), tokensPerSecond)
-			}
+		if ollamaResp.Done {
+			break
 		}
 	}
 	return nil
 }
 
-func (a *Agent) runInference(ctx context.Context, promptPayload string, toolsDescription string) (string, error) {
-	// The system prompt now includes tool descriptions from the Agent struct
-	// and specific instructions on how to call tools.
-	effectiveSystemPrompt := a.systemPrompt + "\n" + toolsDescription
 
-	reqBody := OllamaRequest{
-		Model:  a.model,
-		Prompt: promptPayload, // This is the user's message or latest part of conversation
-		Stream: true,
-		System: effectiveSystemPrompt, // System message for the LLM including tool info
+// --- Main Application Setup ---
+
+// getSystemPrompt can be used to set a default system message for Ollama
+func getSystemPrompt(agentType string) string {
+	switch agentType {
+	case "code":
+		return "You are an expert Go programmer. Provide clear and concise code examples."
+	case "explain":
+		return "You are a technical expert. Explain concepts clearly and thoroughly."
+	default:
+		return "You are a helpful AI assistant."
+	}
+}
+
+// getAvailableOllamaModels fetches /api/tags from Ollama
+func getAvailableOllamaModels(client *http.Client) ([]string, error) {
+	req, err := http.NewRequest("GET", "http://localhost:11434/api/tags", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request for Ollama tags: %v", err)
 	}
 
-	jsonData, err := json.Marshal(reqBody)
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal Ollama request: %v", err)
-	}
-
-	resp, err := http.Post("http://localhost:11434/api/generate", "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", fmt.Errorf("failed to make Ollama request: %v", err)
+		return nil, fmt.Errorf("failed to get Ollama tags: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body) // Read body for more error info
-		return "", fmt.Errorf("Ollama request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("Ollama /api/tags request failed with status %d", resp.StatusCode)
 	}
-	
-	var fullResponse strings.Builder
-	reader := bufio.NewReader(resp.Body)
 
-	for {
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("error reading Ollama stream: %v", err)
-		}
-
-		var ollResp OllamaResponse
-		if errUnmarshal := json.Unmarshal([]byte(line), &ollResp); errUnmarshal != nil {
-			// Log problematic line and error, then continue if possible
-			fmt.Printf("\nWarning: could not unmarshal Ollama response line: <%s>, error: %v\n", strings.TrimSpace(line), errUnmarshal)
-			continue // Skip this line and try to process the next
-		}
-
-		fmt.Print(ollResp.Response) 
-		fullResponse.WriteString(ollResp.Response)
-
-		if ollResp.Done {
-			break
-		}
+	var tagsResp OllamaTagsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tagsResp); err != nil {
+		return nil, fmt.Errorf("failed to decode Ollama tags response: %v", err)
 	}
-	return fullResponse.String(), nil
-}
 
-func extractToolCall(response string) string {
-    const toolPrefix = "tool: "
-    // Normalize potential variations in LLM output for tool calls
-    // For example, LLM might add newlines or extra spaces around the tool call.
-    // We are looking for the prefix and then trying to parse the call.
-    
-    // Find the last occurrence of "tool:" in case of multiple attempts or noise
-    lastIdx := strings.LastIndex(response, toolPrefix)
-    if lastIdx == -1 {
-        return "" // No "tool:" prefix found
-    }
-
-    // Extract the part after "tool: "
-    potentialCall := response[lastIdx+len(toolPrefix):]
-    
-    // The LLM might put the tool call on a new line or add other text.
-    // We need to find the actual call, which should look like `tool_name(JSON_ARGS)`.
-    // Let's find the first occurrence of `tool_name(`
-    // This is a heuristic. A more robust parser might be needed for complex LLM outputs.
-    
-    // A simple approach: assume the tool call is the first "word" followed by "(".
-    // And that the arguments are enclosed in the matching ")".
-    
-    // Trim leading/trailing whitespace from the potential call
-    trimmedCall := strings.TrimSpace(potentialCall)
-
-    // Example: tool_name({"key": "value"})
-    // We need to ensure we capture the full JSON argument structure.
-    // The simplest way is to assume the LLM produces it correctly.
-    // If the LLM output is `tool: read_file({"path": "file.txt"}) some other text`,
-    // we want to extract `read_file({"path": "file.txt"})`.
-
-    // Find the first opening parenthesis
-    openParenIdx := strings.Index(trimmedCall, "(")
-    if openParenIdx == -1 {
-        return "" // No opening parenthesis found, not a valid call format
-    }
-
-    // Find the matching closing parenthesis. This is tricky if JSON args have nested parentheses.
-    // For simplicity, we'll find the *last* closing parenthesis.
-    // This assumes the JSON arguments themselves don't have unbalanced outer parentheses.
-    closeParenIdx := strings.LastIndex(trimmedCall, ")")
-    if closeParenIdx == -1 || closeParenIdx < openParenIdx {
-        return "" // No closing parenthesis, or it's before the opening one
-    }
-
-    // The actual tool call string is from the start of the tool name to the closing parenthesis
-    finalCall := trimmedCall[:closeParenIdx+1]
-    
-    // Basic validation: check if it looks like a function call
-    if !strings.Contains(finalCall, "(") || !strings.HasSuffix(finalCall, ")") {
-        return "" // Doesn't look like a tool call
-    }
-    
-    return finalCall
-}
-
-func (a *Agent) executeTool(toolCallInstruction string) string {
-    // toolCallInstruction is expected to be like: read_file({"path":"main.go"})
-    // or list_files({}) or list_files()
-    
-    idxOpenParen := strings.Index(toolCallInstruction, "(")
-    if idxOpenParen == -1 {
-        return fmt.Sprintf("Error: Invalid tool call format. Missing '('. Got: %s", toolCallInstruction)
-    }
-
-    toolName := strings.TrimSpace(toolCallInstruction[:idxOpenParen])
-    
-    idxCloseParen := strings.LastIndex(toolCallInstruction, ")")
-    if idxCloseParen == -1 || idxCloseParen < idxOpenParen {
-        return fmt.Sprintf("Error: Invalid tool call format. Missing closing ')'. Got: %s", toolCallInstruction)
-    }
-
-    argsStr := strings.TrimSpace(toolCallInstruction[idxOpenParen+1 : idxCloseParen])
-    
-    var toolToExecute ToolDefinition // Changed from tools.ToolDefinition
-    found := false
-    for _, t := range a.tools {
-        if t.Name == toolName {
-            toolToExecute = t
-            found = true
-            break
-        }
-    }
-
-    if !found {
-        return fmt.Sprintf("Error: Tool '%s' not found.", toolName)
-    }
-
-    var rawInput json.RawMessage
-    if argsStr == "" { // Handles tool_name()
-        rawInput = json.RawMessage("{}") // Assume empty JSON object for no-arg calls
-    } else {
-        rawInput = json.RawMessage(argsStr)
-    }
-    
-    // Validate if rawInput is valid JSON, especially if argsStr was not empty
-    if argsStr != "" && !json.Valid(rawInput) {
-        // Attempt to fix common LLM mistake: non-string values not quoted.
-        // This is a very basic heuristic. For example, if it's just a path string.
-        // If the schema expects a single string and we got `some/path.txt` instead of `{"path":"some/path.txt"}`.
-        // This part is tricky and depends on how robust you want the parsing to be.
-        // For now, we'll assume the LLM provides valid JSON or an empty string for args.
-        // If it's not valid JSON, and not empty, it's an error.
-        return fmt.Sprintf("Error: Tool arguments are not valid JSON: %s", argsStr)
-    }
-
-    result, err := toolToExecute.Function(rawInput)
-    if err != nil {
-        return fmt.Sprintf("Error executing tool '%s': %v", toolName, err)
-    }
-    return result
-}
-
-
-// --- Main Application Setup ---
-func getSystemPrompt(agentType string) string {
-	switch agentType {
-	case "code":
-		return "You are an expert programmer. You can use tools to interact with the file system. When you want to use a tool, respond *only* in the format 'tool: <tool_name>({<json_args>})'. For example: 'tool: read_file({\"path\":\"src/main.go\"})'. Do not add any other text before or after the tool call. If you are not using a tool, respond normally."
-	case "explain":
-		return "You are a technical expert. You can use tools. When you want to use a tool, respond *only* in the format 'tool: <tool_name>({<json_args>})'. If you are not using a tool, respond normally."
-	default:
-		return "You are a helpful AI assistant. You can use tools. When you want to use a tool, respond *only* in the format 'tool: <tool_name>({<json_args>})'. If you are not using a tool, respond normally."
+	var modelNames []string
+	for _, model := range tagsResp.Models {
+		modelNames = append(modelNames, model.Name)
 	}
+	return modelNames, nil
 }
 
-func getAvailableModels() ([]string, error) {
-	resp, err := http.Get("http://localhost:11434/api/tags")
+// selectOllamaModel prompts user to select from available models
+func selectOllamaModel(client *http.Client) (string, error) {
+	models, err := getAvailableOllamaModels(client)
 	if err != nil {
-		return nil, fmt.Errorf("error getting models: %v", err)
+		return "", fmt.Errorf("could not fetch available Ollama models: %w", err)
 	}
-	defer resp.Body.Close()
-
-	var modelResp OllamaModelResponse
-	if err := json.NewDecoder(resp.Body).Decode(&modelResp); err != nil {
-		return nil, fmt.Errorf("error decoding response: %v", err)
-	}
-
-	models := make([]string, 0, len(modelResp.Models))
-	for _, model := range modelResp.Models {
-		models = append(models, model.Name)
-	}
-	return models, nil
-}
-
-func selectModel() (string, error) {
-	models, err := getAvailableModels()
-	if err != nil {
-		return "", err
-	}
-
 	if len(models) == 0 {
-		return "", fmt.Errorf("no Ollama models available. Please ensure Ollama is running and models are pulled")
+		return "", fmt.Errorf("no Ollama models found. Ensure Ollama is running and models are pulled (e.g., 'ollama pull llama3')")
 	}
 
-	fmt.Println("\nAvailable models:")
-	for i, model := range models {
-		fmt.Printf("%d. %s\n", i+1, model)
+	fmt.Println("\nAvailable Ollama models:")
+	for i, name := range models {
+		fmt.Printf("%d. %s\n", i+1, name)
 	}
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("\nSelect a model (enter number): ")
+		fmt.Print("Select a model by number: ")
 		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		var num int
-		num, err = strconv.Atoi(input) // Ensure strconv is imported
-		if err == nil && num > 0 && num <= len(models) {
-			return models[num-1], nil
+		selection, err := strconv.Atoi(strings.TrimSpace(input))
+		if err == nil && selection > 0 && selection <= len(models) {
+			return models[selection-1], nil
 		}
 		fmt.Println("Invalid selection. Please try again.")
 	}
 }
 
+
 func main() {
-	modelName := flag.String("model", "", "Name of the Ollama model to use (e.g., llama3:latest, codellama:latest)")
-	agentType := flag.String("agent", "default", "Type of agent to use (default, code, explain)")
-	// oneshot := flag.Bool("oneshot", false, "Run a single interaction without looping") // Can be added back
-	// inputFile := flag.String("file", "", "Path to file containing the prompt") // Can be added back
+	// Command-line flags for Ollama model and agent type
+	defaultModel := "llama3:latest" // A common default, user might need to change
+	modelNameFlag := flag.String("model", "", fmt.Sprintf("Name of the Ollama model to use (e.g., llama3:latest, codellama:latest). If empty, you will be prompted to select."))
+	agentTypeFlag := flag.String("agent", "code", "Type of agent behavior (default, code, explain)") // Changed default to "code"
 	flag.Parse()
 
-	selectedModel := *modelName
-	if selectedModel == "" {
+	httpClient := &http.Client{Timeout: 30 * time.Second} // Client for model selection
+	selectedModelName := *modelNameFlag
+
+	if selectedModelName == "" {
 		var err error
-		selectedModel, err = selectModel()
+		selectedModelName, err = selectOllamaModel(httpClient)
 		if err != nil {
-			fmt.Printf("Error selecting model: %v\n", err)
-			return
+			fmt.Printf("Error selecting Ollama model: %v\n", err)
+			// Attempt to use a default if selection fails, or exit
+			fmt.Printf("Attempting to use default model: %s\n", defaultModel)
+			selectedModelName = defaultModel
+			// Check if default model exists (optional, or let runInference fail)
 		}
 	}
-	fmt.Printf("Using model: %s\n", selectedModel)
+	fmt.Printf("Using Ollama model: %s\n", selectedModelName)
 
+
+	// Set up user input
 	scanner := bufio.NewScanner(os.Stdin)
 	getUserMessage := func() (string, bool) {
-		// if *inputFile != "" { ... } // Logic for inputFile can be re-added here
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				fmt.Printf("\nError reading input: %v\n", err)
 			}
-			return "", false 
+			return "", false // End of input or error
 		}
 		return scanner.Text(), true
 	}
 
-	systemPrompt := getSystemPrompt(*agentType)
-	availableTools := []ToolDefinition{ // Changed from tools.ToolDefinition
-		ReadFileDefinition,
-		ListFilesDefinition,
-		EditFileDefinition,
-		WriteFileDefinition,
-	}
+	systemPrompt := getSystemPrompt(*agentTypeFlag)
 
-	agent := NewAgent(selectedModel, getUserMessage, availableTools, systemPrompt)
-	if err := agent.Run(context.Background()); err != nil {
-		fmt.Printf("\nAgent run failed: %v\n", err)
+	// Create and run the agent
+	agent := NewAgent(selectedModelName, getUserMessage, systemPrompt)
+	err := agent.Run(context.Background()) // Use context.Background() for simple cases
+	if err != nil {
+		fmt.Printf("Agent run failed: %s\n", err.Error())
 	}
 }
