@@ -66,7 +66,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	fmt.Printf("Chat with Ollama model %s (use 'ctrl-c' to quit)\n", a.modelName)
 
 	for {
-		fmt.Print("\u001b[94mYou\u001b[0m: ") // Blue for user
+		// The getUserMessage function now handles printing the "You: " or "You (from file...): " prompt
 		userInput, ok := a.getUserMessage()
 		if !ok {
 			break // End of input or scanner error
@@ -128,9 +128,21 @@ func (a *Agent) runInference(ctx context.Context, prompt string, history []strin
 	// Some Ollama models might prefer a specific format or use a 'context' field.
 	fullPrompt := strings.Join(history, "\n\n") // Join all history, then add current prompt
 	if len(history) > 1 { // If there's actual history beyond the current prompt
-		fullPrompt = strings.Join(history[:len(history)-1], "\n\n") + "\n\nUser: " + prompt
+		// Construct a prompt that includes history. This is a simple example.
+		// You might want to format it differently, e.g., "User: ...\nAI: ...\nUser: current_prompt"
+		var historyForPrompt strings.Builder
+		for i, msg := range history[:len(history)-1] { // Exclude the current prompt from this part of history
+			if i%2 == 0 { // Assuming user, AI, user, AI... pattern if we were storing AI responses
+				historyForPrompt.WriteString("User: ")
+			} else {
+				historyForPrompt.WriteString("AI: ")
+			}
+			historyForPrompt.WriteString(msg)
+			historyForPrompt.WriteString("\n\n")
+		}
+		fullPrompt = historyForPrompt.String() + "User: " + prompt
 	} else {
-		fullPrompt = "User: " + prompt
+		fullPrompt = "User: " + prompt // Just the current prompt if no other history
 	}
 
 
@@ -266,7 +278,18 @@ func main() {
 	defaultModel := "llama3:latest" // A common default, user might need to change
 	modelNameFlag := flag.String("model", "", fmt.Sprintf("Name of the Ollama model to use (e.g., llama3:latest, codellama:latest). If empty, you will be prompted to select."))
 	agentTypeFlag := flag.String("agent", "code", "Type of agent behavior (default, code, explain)") // Changed default to "code"
+	promptFileFlag := flag.String("promptfile", "", "Path to a file containing the initial prompt.") // New flag
 	flag.Parse()
+
+	var initialPromptFromFile string
+	if *promptFileFlag != "" {
+		content, err := os.ReadFile(*promptFileFlag)
+		if err != nil {
+			fmt.Printf("Warning: could not read prompt file '%s': %v. Proceeding with interactive input.\n", *promptFileFlag, err)
+		} else {
+			initialPromptFromFile = strings.TrimSpace(string(content))
+		}
+	}
 
 	httpClient := &http.Client{Timeout: 30 * time.Second} // Client for model selection
 	selectedModelName := *modelNameFlag
@@ -287,7 +310,16 @@ func main() {
 
 	// Set up user input
 	scanner := bufio.NewScanner(os.Stdin)
+	isFilePromptUsed := false // State for the getUserMessage closure
+
 	getUserMessage := func() (string, bool) {
+		if initialPromptFromFile != "" && !isFilePromptUsed {
+			fmt.Printf("\u001b[94mYou (from %s)\u001b[0m: %s\n", *promptFileFlag, initialPromptFromFile)
+			isFilePromptUsed = true
+			return initialPromptFromFile, true
+		}
+
+		fmt.Print("\u001b[94mYou\u001b[0m: ") // Standard prompt for stdin
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				fmt.Printf("\nError reading input: %v\n", err)
