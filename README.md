@@ -2,6 +2,31 @@
 
 This project is a command-line interface (CLI) application written in Go that allows users to interact with local language models hosted by Ollama. It provides a simple chat interface in the terminal, maintaining conversation context and displaying basic performance statistics.
 
+## Some Results
+
+All the results below were taken using the same prompt (./prompt.txt) using the qwen2.5-coder:7b model in Ollama.
+
+### MacBook Pro, M4 Pro, 48GB Unified Ram
+
+```bash
+Stats: Tokens: 864, Time: 23.19s, TPS: 37.26
+```
+
+### Beelink SER9 Pro AI Mini PC, AMD Ryzen AI 9 HX 370(80TOPS,12C/24T,5.1GHz), 64G LPDDR5X 8000MHz 2TB PCIe4.0 x4 SSD, AI PC AMD Radeon 890M NPU 50 AI Tops
+
+```bash
+Stats: Tokens: 612, Time: 39.57s, TPS: 15.47
+```
+
+(NOTE:  turns out that AMD ROCm does not support the GPU on that host, so this is all CPU)
+
+
+Lenovo ThinkStation P620 Workstation, AMD Ryzen Threadripper PRO 3945WX 4.0GHz (12 Core), 32 GB DDR4 RAM, 1 TB SSD, Quadro P2000 5GB Graphics Card
+
+```bash
+Stats: Tokens: 824, Time: 39.83s, TPS: 20.69
+```
+
 ## Features
 
 *   **Ollama Integration**: Connects to a local Ollama instance to run inference with various language models.
